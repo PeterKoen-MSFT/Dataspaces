@@ -1,0 +1,403 @@
+# Dataspace PoC — Path B
+# 10 services on a single dataspaces network.
+# All EDC connector and issuer images are stock 0.17.0 from ghcr.io/eclipse-edc.
+#
+# Topology:
+#   - postgres (shared, multi-database)
+#   - vault    (shared dev-mode hashicorp vault)
+#   - keycloak (shared, with mvd realm pre-imported)
+#   - cp-a / ih-a / dp-a   (Participant A)
+#   - cp-b / ih-b / dp-b   (Participant B)
+#   - issuer
+#
+# Host port allocation (only management surfaces exposed):
+#   18080-18083 = participant A controlplane
+#   17081-17084 = participant A identity-hub
+#   11102      = participant A dataplane public
+#   28080-28083 = participant B controlplane
+#   27081-27084 = participant B identity-hub
+#   21102      = participant B dataplane public
+#   19010-19016 = issuer
+#   8888        = keycloak
+#   8200        = vault
+#   5432        = postgres
+#
+# DIDs (used inside the dataspaces network):
+#   did:web:ih-a%3A7083:participant-a
+#   did:web:ih-b%3A7083:participant-b
+#   did:web:issuer%3A10016:issuer
+
+name: dataspaces
+
+networks:
+  dataspaces:
+    driver: bridge
+
+x-common-edc-env: &common-edc-env
+  edc.iam.did.web.use.https: "false"
+  edc.iam.credential.revocation.mimetype: "application/json"
+  edc.sql.schema.autocreate: "true"
+  edc.iam.accesstoken.jti.validation: "true"
+  edc.iam.credential.renewal.graceperiod: "86400"
+  edc.encryption.aes.key.alias: "aes-key-alias"
+  edc.iam.oauth2.issuer: "http://keycloak:8080/realms/mvd"
+  edc.iam.oauth2.jwks.url: "http://keycloak:8080/realms/mvd/protocol/openid-connect/certs"
+
+services:
+
+  # ---------- Shared infrastructure ----------
+
+  postgres:
+    image: docker.io/library/postgres:17-alpine
+    container_name: ds-postgres
+    networks: [dataspaces]
+    ports: ["5432:5432"]
+    environment:
+      POSTGRES_USER: edc
+      POSTGRES_PASSWORD: edc
+      POSTGRES_DB: postgres
+    volumes:
+      - ./postgres/init.sh:/docker-entrypoint-initdb.d/init.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U edc -d postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  vault:
+    image: docker.io/hashicorp/vault:1.18
+    container_name: ds-vault
+    networks: [dataspaces]
+    ports: ["8200:8200"]
+    cap_add: [IPC_LOCK]
+    environment:
+      VAULT_DEV_ROOT_TOKEN_ID: root
+      VAULT_DEV_LISTEN_ADDRESS: 0.0.0.0:8200
+      VAULT_ADDR: http://0.0.0.0:8200
+      SKIP_SETCAP: "true"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8200/v1/sys/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.0
+    container_name: ds-keycloak
+    networks: [dataspaces]
+    ports: ["8888:8080"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: ["start-dev", "--import-realm", "--health-enabled=true"]
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: admin
+      KC_HTTP_ENABLED: "true"
+      KC_HOSTNAME: http://keycloak:8080
+      KC_HOSTNAME_STRICT: "false"
+      KC_HEALTH_ENABLED: "true"
+      KC_DB: postgres
+      KC_DB_URL: jdbc:postgresql://postgres:5432/keycloak
+      KC_DB_USERNAME: edc
+      KC_DB_PASSWORD: edc
+    volumes:
+      - ./keycloak/realm-mvd.json:/opt/keycloak/data/import/realm-mvd.json:ro
+    healthcheck:
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/127.0.0.1/9000 && echo -e 'GET /health/ready HTTP/1.0\\r\\nHost: localhost\\r\\n\\r\\n' >&3 && cat <&3 | grep -q '\"status\": \"UP\"'"]
+      interval: 5s
+      timeout: 5s
+      retries: 60
+      start_period: 30s
+
+  vault-bootstrap:
+    image: docker.io/hashicorp/vault:1.18
+    container_name: ds-vault-bootstrap
+    networks: [dataspaces]
+    depends_on:
+      vault:
+        condition: service_healthy
+      keycloak:
+        condition: service_healthy
+    environment:
+      VAULT_ADDR: http://vault:8200
+      VAULT_TOKEN: root
+    volumes:
+      - ./vault/bootstrap.sh:/bootstrap.sh:ro
+    entrypoint: ["sh", "/bootstrap.sh"]
+    restart: "no"
+
+  # ---------- Participant A ----------
+
+  cp-a:
+    image: ghcr.io/eclipse-edc/minimumviabledataspace/controlplane:0.17.0
+    container_name: ds-cp-a
+    networks: [dataspaces]
+    ports:
+      - "18080:8080"   # default web (health)
+      - "18081:8081"   # management
+      - "18082:8082"   # DSP protocol
+      - "18083:8083"   # control
+    depends_on:
+      postgres: { condition: service_healthy }
+      vault-bootstrap: { condition: service_completed_successfully }
+    environment:
+      <<: *common-edc-env
+      edc.hostname: cp-a
+      edc.participant.id: "did:web:ih-a%3A7083:participant-a"
+      edc.iam.sts.oauth.token.url: "http://ih-a:7084/api/sts/token"
+      edc.iam.sts.oauth.client.id: "did:web:ih-a%3A7083:participant-a"
+      edc.iam.sts.oauth.client.secret.alias: "participant-a-sts-client-secret"
+      edc.iam.trusted-issuer.issuer.id: "did:web:issuer%3A10016:issuer"
+      web.http.port: "8080"
+      web.http.path: "/api"
+      web.http.management.port: "8081"
+      web.http.management.path: "/api/mgmt"
+      web.http.protocol.port: "8082"
+      web.http.protocol.path: "/api/dsp"
+      web.http.control.port: "8083"
+      web.http.control.path: "/api/control"
+      edc.vault.hashicorp.url: "http://vault:8200"
+      edc.vault.hashicorp.token: "root"
+      edc.datasource.default.url: "jdbc:postgresql://postgres:5432/cp_a"
+      edc.datasource.default.user: "edc"
+      edc.datasource.default.password: "edc"
+      edc.iam.dcp.scopes.membership.id: "membership-scope"
+      edc.iam.dcp.scopes.membership.type: "DEFAULT"
+      edc.iam.dcp.scopes.membership.value: "org.eclipse.dspace.dcp.vc.type:MembershipCredential:read"
+      edc.iam.dcp.scopes.partner.id: "partner-scope"
+      edc.iam.dcp.scopes.partner.type: "DEFAULT"
+      edc.iam.dcp.scopes.partner.value: "org.eclipse.dspace.dcp.vc.type:PartnerCredential:read"
+
+  ih-a:
+    image: ghcr.io/eclipse-edc/minimumviabledataspace/identity-hub:0.17.0
+    container_name: ds-ih-a
+    networks: [dataspaces]
+    ports:
+      - "17080:7080"
+      - "17081:7081"
+      - "17082:7082"
+      - "17083:7083"
+      - "17084:7084"
+    depends_on:
+      postgres: { condition: service_healthy }
+      vault-bootstrap: { condition: service_completed_successfully }
+    environment:
+      <<: *common-edc-env
+      edc.hostname: ih-a
+      edc.ih.iam.publickey.alias: "publickey-alias"
+      web.http.port: "7080"
+      web.http.path: "/api"
+      web.http.identity.port: "7081"
+      web.http.identity.path: "/api/identity"
+      web.http.identity.auth.key: "password"
+      web.http.credentials.port: "7082"
+      web.http.credentials.path: "/api/credentials"
+      web.http.did.port: "7083"
+      web.http.did.path: "/"
+      web.http.sts.port: "7084"
+      web.http.sts.path: "/api/sts"
+      edc.vault.hashicorp.url: "http://vault:8200"
+      edc.vault.hashicorp.token: "root"
+      edc.datasource.default.url: "jdbc:postgresql://postgres:5432/ih_a"
+      edc.datasource.default.user: "edc"
+      edc.datasource.default.password: "edc"
+
+  dp-a:
+    image: ghcr.io/eclipse-edc/minimumviabledataspace/dataplane:0.17.0
+    container_name: ds-dp-a
+    networks: [dataspaces]
+    ports:
+      - "11100:8080"
+      - "11101:8083"
+      - "11102:11002"
+      - "11186:8186"
+    depends_on:
+      postgres: { condition: service_healthy }
+      vault-bootstrap: { condition: service_completed_successfully }
+    environment:
+      edc.hostname: dp-a
+      edc.transfer.proxy.token.verifier.publickey.alias: "dp-a-public"
+      edc.transfer.proxy.token.signer.privatekey.alias: "dp-a-private"
+      edc.dpf.selector.url: "http://cp-a:8083/api/control/v1/dataplanes"
+      web.http.port: "8080"
+      web.http.path: "/api"
+      web.http.control.port: "8083"
+      web.http.control.path: "/api/control"
+      web.http.public.port: "11002"
+      web.http.public.path: "/api/public"
+      web.http.certs.port: "8186"
+      web.http.certs.path: "/api/data"
+      edc.vault.hashicorp.url: "http://vault:8200"
+      edc.vault.hashicorp.token: "root"
+      edc.datasource.default.url: "jdbc:postgresql://postgres:5432/dp_a"
+      edc.datasource.default.user: "edc"
+      edc.datasource.default.password: "edc"
+      edc.sql.schema.autocreate: "true"
+
+  # ---------- Participant B ----------
+
+  cp-b:
+    image: ghcr.io/eclipse-edc/minimumviabledataspace/controlplane:0.17.0
+    container_name: ds-cp-b
+    networks: [dataspaces]
+    ports:
+      - "28080:8080"
+      - "28081:8081"
+      - "28082:8082"
+      - "28083:8083"
+    depends_on:
+      postgres: { condition: service_healthy }
+      vault-bootstrap: { condition: service_completed_successfully }
+    environment:
+      <<: *common-edc-env
+      edc.hostname: cp-b
+      edc.participant.id: "did:web:ih-b%3A7083:participant-b"
+      edc.iam.sts.oauth.token.url: "http://ih-b:7084/api/sts/token"
+      edc.iam.sts.oauth.client.id: "did:web:ih-b%3A7083:participant-b"
+      edc.iam.sts.oauth.client.secret.alias: "participant-b-sts-client-secret"
+      edc.iam.trusted-issuer.issuer.id: "did:web:issuer%3A10016:issuer"
+      web.http.port: "8080"
+      web.http.path: "/api"
+      web.http.management.port: "8081"
+      web.http.management.path: "/api/mgmt"
+      web.http.protocol.port: "8082"
+      web.http.protocol.path: "/api/dsp"
+      web.http.control.port: "8083"
+      web.http.control.path: "/api/control"
+      edc.vault.hashicorp.url: "http://vault:8200"
+      edc.vault.hashicorp.token: "root"
+      edc.datasource.default.url: "jdbc:postgresql://postgres:5432/cp_b"
+      edc.datasource.default.user: "edc"
+      edc.datasource.default.password: "edc"
+      edc.iam.dcp.scopes.membership.id: "membership-scope"
+      edc.iam.dcp.scopes.membership.type: "DEFAULT"
+      edc.iam.dcp.scopes.membership.value: "org.eclipse.dspace.dcp.vc.type:MembershipCredential:read"
+      edc.iam.dcp.scopes.partner.id: "partner-scope"
+      edc.iam.dcp.scopes.partner.type: "DEFAULT"
+      edc.iam.dcp.scopes.partner.value: "org.eclipse.dspace.dcp.vc.type:PartnerCredential:read"
+
+  ih-b:
+    image: ghcr.io/eclipse-edc/minimumviabledataspace/identity-hub:0.17.0
+    container_name: ds-ih-b
+    networks: [dataspaces]
+    ports:
+      - "27080:7080"
+      - "27081:7081"
+      - "27082:7082"
+      - "27083:7083"
+      - "27084:7084"
+    depends_on:
+      postgres: { condition: service_healthy }
+      vault-bootstrap: { condition: service_completed_successfully }
+    environment:
+      <<: *common-edc-env
+      edc.hostname: ih-b
+      edc.ih.iam.publickey.alias: "publickey-alias"
+      web.http.port: "7080"
+      web.http.path: "/api"
+      web.http.identity.port: "7081"
+      web.http.identity.path: "/api/identity"
+      web.http.identity.auth.key: "password"
+      web.http.credentials.port: "7082"
+      web.http.credentials.path: "/api/credentials"
+      web.http.did.port: "7083"
+      web.http.did.path: "/"
+      web.http.sts.port: "7084"
+      web.http.sts.path: "/api/sts"
+      edc.vault.hashicorp.url: "http://vault:8200"
+      edc.vault.hashicorp.token: "root"
+      edc.datasource.default.url: "jdbc:postgresql://postgres:5432/ih_b"
+      edc.datasource.default.user: "edc"
+      edc.datasource.default.password: "edc"
+
+  dp-b:
+    image: ghcr.io/eclipse-edc/minimumviabledataspace/dataplane:0.17.0
+    container_name: ds-dp-b
+    networks: [dataspaces]
+    ports:
+      - "21100:8080"
+      - "21101:8083"
+      - "21102:11002"
+      - "21186:8186"
+    depends_on:
+      postgres: { condition: service_healthy }
+      vault-bootstrap: { condition: service_completed_successfully }
+    environment:
+      edc.hostname: dp-b
+      edc.transfer.proxy.token.verifier.publickey.alias: "dp-b-public"
+      edc.transfer.proxy.token.signer.privatekey.alias: "dp-b-private"
+      edc.dpf.selector.url: "http://cp-b:8083/api/control/v1/dataplanes"
+      web.http.port: "8080"
+      web.http.path: "/api"
+      web.http.control.port: "8083"
+      web.http.control.path: "/api/control"
+      web.http.public.port: "11002"
+      web.http.public.path: "/api/public"
+      web.http.certs.port: "8186"
+      web.http.certs.path: "/api/data"
+      edc.vault.hashicorp.url: "http://vault:8200"
+      edc.vault.hashicorp.token: "root"
+      edc.datasource.default.url: "jdbc:postgresql://postgres:5432/dp_b"
+      edc.datasource.default.user: "edc"
+      edc.datasource.default.password: "edc"
+      edc.sql.schema.autocreate: "true"
+
+  # ---------- Issuer ----------
+
+  issuer:
+    image: ghcr.io/eclipse-edc/minimumviabledataspace/issuerservice:0.17.0
+    container_name: ds-issuer
+    networks: [dataspaces]
+    ports:
+      - "19010:10010"
+      - "19011:10011"
+      - "19012:10012"
+      - "19013:10013"
+      - "19015:10015"
+      - "19016:10016"
+      - "19999:9999"
+    depends_on:
+      postgres: { condition: service_healthy }
+      vault-bootstrap: { condition: service_completed_successfully }
+      keycloak: { condition: service_healthy }
+    environment:
+      edc.hostname: issuer
+      edc.issuer.statuslist.signing.key.alias: "statuslist-signing-key"
+      edc.ih.api.superuser.key: "c3VwZXItdXNlcg==.c3VwZXItc2VjcmV0LWtleQo="
+      edc.iam.did.web.use.https: "false"
+      edc.iam.accesstoken.jti.validation: "true"
+      edc.encryption.aes.key.alias: "aes-key-alias"
+      edc.iam.oauth2.issuer: "http://keycloak:8080/realms/mvd"
+      edc.iam.oauth2.jwks.url: "http://keycloak:8080/realms/mvd/protocol/openid-connect/certs"
+      web.http.port: "10010"
+      web.http.path: "/api"
+      web.http.sts.port: "10011"
+      web.http.sts.path: "/api/sts"
+      web.http.issuance.port: "10012"
+      web.http.issuance.path: "/api/issuance"
+      web.http.issueradmin.port: "10013"
+      web.http.issueradmin.path: "/api/admin"
+      web.http.identity.port: "10015"
+      web.http.identity.path: "/api/identity"
+      web.http.did.port: "10016"
+      web.http.did.path: "/"
+      web.http.statuslist.port: "9999"
+      web.http.statuslist.path: "/statuslist"
+      edc.vault.hashicorp.url: "http://vault:8200"
+      edc.vault.hashicorp.token: "root"
+      edc.datasource.default.url: "jdbc:postgresql://postgres:5432/issuerservice"
+      edc.datasource.default.user: "edc"
+      edc.datasource.default.password: "edc"
+      edc.datasource.membership.url: "jdbc:postgresql://postgres:5432/issuerservice"
+      edc.datasource.membership.user: "edc"
+      edc.datasource.membership.password: "edc"
+      edc.sql.schema.autocreate: "true"
+
+  # ---------- Static asset server (resources.txt) ----------
+  resources-a:
+    image: docker.io/library/nginx:1.27-alpine
+    container_name: ds-resources-a
+    networks: [dataspaces]
+    volumes:
+      - ../assets:/usr/share/nginx/html:ro

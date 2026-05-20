@@ -1,0 +1,7 @@
+https://github.com/eclipse-dataspace-hub
+https://github.com/eclipse-edc
+https://github.com/eclipse-dataplane-signaling
+https://github.com/eclipse-dataspace-dcp
+https://github.com/eclipse-dataspacetck
+https://eclipse-dataspace-protocol-base.github.io/DataspaceProtocol/2025-1-err1/
+https://dataspacebuilder.github.io/website/docs/
